@@ -3,14 +3,17 @@ import 'dart:async';
 import 'package:dgg/app/app.locator.dart';
 import 'package:dgg/app/app.router.dart';
 import 'package:dgg/datamodels/dgg_vote.dart';
+import 'package:dgg/datamodels/embeds.dart';
 import 'package:dgg/datamodels/emotes.dart';
 import 'package:dgg/datamodels/flairs.dart';
 import 'package:dgg/datamodels/message.dart';
 import 'package:dgg/datamodels/stream_status.dart';
 import 'package:dgg/datamodels/user.dart';
 import 'package:dgg/datamodels/user_message_element.dart';
+import 'package:dgg/services/image_service.dart';
 import 'package:dgg/services/shared_preferences_service.dart';
 import 'package:dgg/ui/widgets/setup_bottom_sheet_ui.dart';
+import 'package:dgg/ui/widgets/setup_dialog_ui.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
@@ -24,8 +27,6 @@ import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 import 'package:flutter_custom_tabs/flutter_custom_tabs.dart'
     as flutter_custom_tabs;
 
-import '../../../datamodels/embeds.dart';
-
 class ChatViewModel extends BaseViewModel {
   final _dggService = locator<DggService>();
   final _sharedPreferencesService = locator<SharedPreferencesService>();
@@ -33,20 +34,29 @@ class ChatViewModel extends BaseViewModel {
   final _bottomSheetService = locator<BottomSheetService>();
   final _snackbarService = locator<SnackbarService>();
   final _dialogService = locator<DialogService>();
+  final _imageService = locator<ImageService>();
 
   late WebViewController webViewController;
   YoutubePlayerController? youtubePlayerController;
   final chatInputController = TextEditingController();
 
-  bool get isLoading => isAuthenticating || !isAssetsLoaded;
+  bool get isLoading => isAuthenticating || !_assetsLoaded;
   bool get isAuthenticating => _dggService.sessionInfo == null;
-  bool get isAssetsLoaded => _dggService.assetsLoaded;
   bool get isSignedIn => _dggService.isSignedIn;
+
+  bool _assetsLoaded = false;
+  bool get assetsLoaded => _assetsLoaded;
+  late Flairs _flairs;
+  late Emotes _emotes;
+  bool _loadingEmote = false;
+  final List<Emote> _emoteLoadQueue = [];
+  bool _loadingFlair = false;
+  final List<Flair> _flairLoadQueue = [];
 
   StreamSubscription? _chatSubscription;
   final List<Message> _messages = [];
   List<Message> get messages => _isListAtBottom ? _messages : _pausedMessages;
-  List<User> _users = [];
+  final Map<String, User> _userMap = {};
   bool _isChatConnected = false;
   bool get isChatConnected => _isChatConnected;
   bool _isListAtBottom = true;
@@ -74,8 +84,6 @@ class ChatViewModel extends BaseViewModel {
   bool get showEmbed => _showEmbed;
   EmbedType _embedType = EmbedType.TWITCH_STREAM;
   EmbedType get embedType => _embedType;
-
-  bool showChat = true;
 
   DggVote? _currentVote;
   DggVote? get currentVote => _currentVote;
@@ -106,10 +114,9 @@ class ChatViewModel extends BaseViewModel {
   bool get showEmoteSelector => _showEmoteSelector;
   List<Emote>? emoteSelectorList;
 
-  bool _isHighlightOn = false;
-  bool get isHighlightOn => _isHighlightOn;
   User? _userHighlighted;
   User? get userHighlighted => _userHighlighted;
+  bool get isHighlightOn => _userHighlighted != null;
 
   Future<void> initialize() async {
     if (!_sharedPreferencesService.getOnboarding()) {
@@ -126,7 +133,7 @@ class ChatViewModel extends BaseViewModel {
     notifyListeners();
     await _getSessionInfo();
     _getStreamStatus();
-    await _dggService.getAssets();
+    await _loadAssets();
     await _getChatHistory();
     _connectChat();
     _showChangelog();
@@ -137,6 +144,15 @@ class ChatViewModel extends BaseViewModel {
     notifyListeners();
   }
 
+  Future<void> _loadAssets() async {
+    String? cacheKey = await _dggService.fetchDggCacheKey();
+
+    _flairs = await _dggService.fetchFlairs(cacheKey);
+    _emotes = await _dggService.fetchEmotes(cacheKey);
+    await _imageService.validateCache(cacheKey);
+    _assetsLoaded = true;
+  }
+
   Future<void> _getChatHistory() async {
     List<dynamic> rawHistoryMessages = await _dggService.getChatHistory();
 
@@ -145,19 +161,13 @@ class ChatViewModel extends BaseViewModel {
     }
   }
 
-  Future<List<Embed>> getEmbeds() async {
-    List<dynamic> embeds = await _dggService.getEmbeds();
-    List<Embed> embedsList = [];
-
-    for (int i = 0; i < embeds.length; i++) {
-      embedsList.add(Embed.fromJson(embeds[i]));
-    }
-
-    return embedsList;
+  Future<List<Embed>> _getEmbeds() async {
+    return _dggService.getEmbeds();
   }
 
   void _connectChat() {
     _showReconnectButton = false;
+    _userMap.clear();
     _messages.add(const StatusMessage(data: "Connecting..."));
     notifyListeners();
     _chatSubscription?.cancel();
@@ -169,17 +179,30 @@ class ChatViewModel extends BaseViewModel {
   }
 
   void _processMessage(String? data) {
-    Message? currentMessage = _dggService.parseWebSocketData(data, _users);
+    String dataString = data.toString();
+    int spaceIndex = dataString.indexOf(' ');
+    String key = dataString.substring(0, spaceIndex);
+    String jsonString = dataString.substring(spaceIndex + 1);
 
-    switch (currentMessage.runtimeType) {
-      case NamesMessage:
+    switch (key) {
+      case "NAMES":
+        final namesMessage = NamesMessage.fromJson(jsonString);
         _isChatConnected = true;
-        _users = (currentMessage as NamesMessage).users;
-        _messages
-            .add(StatusMessage(data: "Connected with ${_users.length} users"));
+        for (var user in namesMessage.users) {
+          _userMap[user.nick] = user;
+        }
+        _messages.add(
+          StatusMessage(data: "Connected with ${_userMap.length} users"),
+        );
         break;
-      case UserMessage:
-        UserMessage userMessage = currentMessage as UserMessage;
+      case "MSG":
+        final userMessage = UserMessage.fromJson(
+          jsonString,
+          _flairs,
+          _emotes,
+          _userMap,
+          _dggService.currentNick,
+        );
         if (_flairEnabled) {
           //for each flair, check if it needs to be loaded
           for (var flair in userMessage.visibleFlairs) {
@@ -252,8 +275,14 @@ class ChatViewModel extends BaseViewModel {
           if (temp.isEmpty && userMessage.data.length < 3) {
             int vote = int.parse(userMessage.data);
             if (vote > 0 && vote <= _currentVote!.options.length) {
-              _currentVote!.castVote(
-                  userMessage.user.nick, vote, userMessage.user.features);
+              // Cast vote and if it counted break so message is not shown
+              if (_currentVote!.castVote(
+                userMessage.user.nick,
+                vote,
+                userMessage.user.features,
+              )) {
+                break;
+              }
             }
           }
         }
@@ -263,18 +292,21 @@ class ChatViewModel extends BaseViewModel {
           _messages.add(userMessage);
         }
         break;
-      case JoinMessage:
-        _users.add((currentMessage as JoinMessage).user);
+      case "JOIN":
+        final joinMessage = JoinMessage.fromJson(jsonString);
+        _userMap[joinMessage.user.nick] = joinMessage.user;
         break;
-      case QuitMessage:
-        _users.remove((currentMessage as QuitMessage).user);
+      case "QUIT":
+        final quitMessage = QuitMessage.fromJson(jsonString);
+        _userMap.remove(quitMessage.user.nick);
         break;
-      case BroadcastMessage:
-        _messages.add(currentMessage!);
+      case "BROADCAST":
+        final broadcastMessage = BroadcastMessage.fromJson(jsonString);
+        _messages.add(broadcastMessage);
         break;
-      case MuteMessage:
+      case "MUTE":
         //Go through up to previous 10 messages and censor messages from muted user
-        MuteMessage muteMessage = currentMessage as MuteMessage;
+        final muteMessage = MuteMessage.fromJson(jsonString);
         int lengthToCheck = _messages.length >= 11 ? 11 : _messages.length;
         for (int i = 1; i < lengthToCheck; i++) {
           Message msg = _messages[_messages.length - i];
@@ -287,32 +319,34 @@ class ChatViewModel extends BaseViewModel {
         _messages.add(StatusMessage(
             data: "${muteMessage.data} muted by ${muteMessage.nick}"));
         break;
-      case UnmuteMessage:
-        UnmuteMessage unmuteMessage = currentMessage as UnmuteMessage;
+      case "UNMUTE":
+        final unmuteMessage = UnmuteMessage.fromJson(jsonString);
         _messages.add(StatusMessage(
             data: "${unmuteMessage.data} unmuted by ${unmuteMessage.nick}"));
         break;
-      case BanMessage:
-        BanMessage banMessage = currentMessage as BanMessage;
+      case "BAN":
+        final banMessage = BanMessage.fromJson(jsonString);
         _messages.add(StatusMessage(
             data: "${banMessage.data} banned by ${banMessage.nick}"));
         break;
-      case UnbanMessage:
-        UnbanMessage unbanMessage = currentMessage as UnbanMessage;
+      case "UNBAN":
+        final unbanMessage = UnbanMessage.fromJson(jsonString);
         _messages.add(StatusMessage(
             data: "${unbanMessage.data} unbanned by ${unbanMessage.nick}"));
         break;
-      case StatusMessage:
-        _messages.add(currentMessage!);
+      case "REFRESH":
+        _messages.add(
+          const StatusMessage(data: "Being disconnected by server..."),
+        );
         break;
-      case SubOnlyMessage:
-        SubOnlyMessage subOnlyMessage = currentMessage as SubOnlyMessage;
+      case "SUBONLY":
+        final subOnlyMessage = SubOnlyMessage.fromJson(jsonString);
         String subMode = subOnlyMessage.data == 'on' ? 'enabled' : 'disabled';
         _messages.add(StatusMessage(
             data: "Subscriber only mode $subMode by ${subOnlyMessage.nick}"));
         break;
-      case ErrorMessage:
-        ErrorMessage errorMessage = currentMessage as ErrorMessage;
+      case "ERR":
+        final errorMessage = ErrorMessage.fromJson(jsonString);
         if (errorMessage.description == "banned") {
           _messages.add(const StatusMessage(
             data:
@@ -341,6 +375,7 @@ class ChatViewModel extends BaseViewModel {
         }
         break;
       default:
+        print(data);
         break;
     }
 
@@ -371,14 +406,68 @@ class ChatViewModel extends BaseViewModel {
     _connectChat();
   }
 
-  Future<void> _loadEmote(Emote emote) async {
-    await _dggService.loadEmote(emote);
-    notifyListeners();
+  Future<void> _loadEmote(Emote emote, {bool fromQueue = false}) async {
+    bool loaded = false;
+    // Check if emote has already been loaded before trying to load it
+    if (emote.image == null) {
+      // Set loading to true for current emote so additional copies are not put in the queue
+      emote.loading = true;
+      if (_loadingEmote) {
+        // Another emote is already being loaded, add current to the queue
+        _emoteLoadQueue.add(emote);
+      } else {
+        // Load emote
+        _loadingEmote = true;
+        emote.image = await _imageService.loadAndProcessEmote(emote);
+
+        emote.loading = false;
+        _loadingEmote = false;
+        loaded = true;
+        notifyListeners();
+      }
+    }
+
+    // If load request came from queue and emote is loaded, remove it
+    if (fromQueue && emote.image != null) {
+      _emoteLoadQueue.removeAt(0);
+    }
+
+    // If loaded emote and still have emotes in the queue, start loading the next one
+    if (loaded && _emoteLoadQueue.isNotEmpty) {
+      _loadEmote(_emoteLoadQueue.first, fromQueue: true);
+    }
   }
 
-  Future<void> _loadFlair(Flair flair) async {
-    await _dggService.loadFlair(flair);
-    notifyListeners();
+  Future<void> _loadFlair(Flair flair, {bool fromQueue = false}) async {
+    bool loaded = false;
+    // Check if flair has already been loaded before trying to load it
+    if (flair.image == null) {
+      // Set loading to true for current flair so additional copies are not put in the queue
+      flair.loading = true;
+      if (_loadingFlair) {
+        // Another flair is already being loaded, add current to the queue
+        _flairLoadQueue.add(flair);
+      } else {
+        // Load flair
+        _loadingFlair = true;
+        flair.image = await _imageService.loadAndProcessFlair(flair);
+
+        flair.loading = false;
+        _loadingFlair = false;
+        loaded = true;
+        notifyListeners();
+      }
+    }
+
+    // If load request came from queue and flair is loaded, remove it
+    if (fromQueue && flair.image != null) {
+      _flairLoadQueue.removeAt(0);
+    }
+
+    // If loaded flair and still have flairs in the queue, start loading the next one
+    if (loaded && _flairLoadQueue.isNotEmpty) {
+      _loadFlair(_flairLoadQueue.first, fromQueue: true);
+    }
   }
 
   void uncensorMessage(UserMessage message) {
@@ -417,15 +506,43 @@ class ChatViewModel extends BaseViewModel {
         // First disconnect from chat
         await _disconnectChat();
         // Then clear assets
-        await _dggService.clearAssets();
+        _assetsLoaded = false;
         // Finally fetch assets
-        await _dggService.getAssets();
+        await _loadAssets();
         notifyListeners();
         // Re-open chat
         _connectChat();
         break;
       case AppBarActions.OPEN_DESTINY_STREAM:
         _openDestinyStream();
+        break;
+      case AppBarActions.OPEN_TWITCH_STREAM:
+        // Prompt user to enter a Twitch channel name and try to open it
+        final response = await _dialogService.showCustomDialog(
+          variant: DialogType.INPUT,
+          title: "Open Twitch stream",
+          description: "Enter the name of the Twitch channel you want to open",
+          barrierDismissible: true,
+        );
+        if (response != null && response.data != null) {
+          setStreamChannelManual(response.data);
+        }
+        break;
+      case AppBarActions.TOGGLE_EMBED:
+        setShowEmbed(!_showEmbed);
+        break;
+      case AppBarActions.GET_RECENT_EMBEDS:
+        // Get top embeds from past 30 minutes and allow user to select one
+        final response = await _dialogService.showCustomDialog(
+          variant: DialogType.SELECT_OPTION_FUTURE,
+          title: "Recent embeds",
+          description: "Select an embed to open it",
+          data: _getEmbeds(),
+          barrierDismissible: true,
+        );
+        if (response != null && response.data != null) {
+          setEmbed(response.data.channel, response.data.platform);
+        }
         break;
       default:
         print("ERROR: Invalid chat menu item");
@@ -511,14 +628,14 @@ class ChatViewModel extends BaseViewModel {
         );
 
         //check emotes
-        _dggService.emotes.emoteMap.forEach((k, v) {
+        _emotes.emoteMap.forEach((k, v) {
           if (k.startsWith(lastWordRegex)) {
             newSuggestions.add(k);
           }
         });
 
         //check user names
-        for (var user in _users) {
+        for (var user in _userMap.values) {
           if (user.nick.startsWith(lastWordRegex)) {
             newSuggestions.add(user.nick);
           }
@@ -572,19 +689,13 @@ class ChatViewModel extends BaseViewModel {
     }
   }
 
-  void toggleHighlightUser(User user) {
-    if (_isHighlightOn) {
-      _userHighlighted = null;
-    } else {
-      _userHighlighted = user;
-    }
-    _isHighlightOn = !_isHighlightOn;
+  void enableHighlightUser(User user) {
+    _userHighlighted = user;
     notifyListeners();
   }
 
   void disableHighlightUser() {
     _userHighlighted = null;
-    _isHighlightOn = false;
     notifyListeners();
   }
 
@@ -594,8 +705,8 @@ class ChatViewModel extends BaseViewModel {
     notifyListeners();
   }
 
-  void setStreamChannelManual(List<String>? channel) {
-    if (channel != null && channel[0].trim().isNotEmpty) {
+  void setStreamChannelManual(String channel) {
+    if (channel.trim().isNotEmpty) {
       setEmbed(channel[0], "twitch");
     }
   }
@@ -643,7 +754,10 @@ class ChatViewModel extends BaseViewModel {
         _embedType = EmbedType.TWITCH_CLIP;
         break;
       default:
-        break;
+        _snackbarService.showSnackbar(
+          message: "$embedType is not currently supported",
+        );
+        return;
     }
     //Show the stream embed
     setShowEmbed(true);
@@ -751,7 +865,7 @@ class ChatViewModel extends BaseViewModel {
     // Open default stream platform
     if (_sharedPreferencesService.getDefaultStream() == 0) {
       // Open Destiny's stream on Twitch
-      setStreamChannelManual(["destiny"]);
+      setStreamChannelManual("destiny");
     } else {
       // Open Destiny's stream on YouTube
       StreamStatus streamStatus = await _dggService.getStreamStatus();
@@ -770,7 +884,7 @@ class ChatViewModel extends BaseViewModel {
       _dialogService.showDialog(
         title: "What's new",
         description:
-            "• Fixed a bug that caused the keyboard to be dismissed immediately.\n• Added an emote selector to make it easier to add emotes to chat messages.\n• Added ignore list support so you can hide other users.",
+            "• User mentions and highlighting are now supported. Thanks to Ricky434 for the feature.\n• Recent popular embeds can now be fetched and opened. Thanks to Vyneer for the api and Ricky434 for the feature.\n• Emote loading should be more stable now.",
       );
     }
   }
@@ -830,7 +944,7 @@ class ChatViewModel extends BaseViewModel {
     notifyListeners();
     // Load all emotes if not all already loaded
     if (emoteSelectorList == null) {
-      emoteSelectorList = _dggService.emotes.emoteMap.values.toList();
+      emoteSelectorList = _emotes.emoteMap.values.toList();
       for (var emote in emoteSelectorList!) {
         if (!emote.loading && emote.image == null) {
           _loadEmote(emote);
@@ -881,5 +995,6 @@ enum AppBarActions {
   REFRESH,
   OPEN_DESTINY_STREAM,
   OPEN_TWITCH_STREAM,
-  SHOW_EMBEDS
+  GET_RECENT_EMBEDS,
+  TOGGLE_EMBED,
 }
